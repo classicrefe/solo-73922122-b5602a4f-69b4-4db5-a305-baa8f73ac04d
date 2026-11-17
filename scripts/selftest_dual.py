@@ -216,6 +216,99 @@ def main() -> None:
         check("双实例一致性自检", integrity["ok"] and integrity["batches"] == 2, integrity)
         page = httpx.get(f"{B}/")
         check("网页可打开展示过期提示", page.status_code == 200)
+
+        # 8. 可选上传编号：重试 / 冲突 / 结构化后重放
+        v = httpx.get(f"{A}/api/schema").json()["schema_version"]
+        dup_payload = csv_bytes(
+            ["station_id", "observed_at", "temp_c", "humidity"],
+            [["54511", "2026-04-01T00:00:00Z", "66", "33"]],
+        )
+        first = httpx.post(
+            f"{A}/api/batches",
+            data={"version": v, "upload_id": "selftest-dup-1"},
+            files={"file": ("dup.csv", dup_payload, "text/csv")},
+            timeout=30,
+        )
+        check("带编号首次上传成功", first.status_code == 201, first.text[:160])
+        first = first.json()
+        check("首次回执标记为非重放", first["replayed"] is False and first["upload_id"] == "selftest-dup-1")
+
+        replay = httpx.post(
+            f"{B}/api/batches",
+            data={"version": v, "upload_id": "selftest-dup-1"},
+            files={"file": ("dup.csv", dup_payload, "text/csv")},
+            timeout=30,
+        )
+        check("同编号同字节返回首次回执", replay.status_code == 200 and replay.json()["id"] == first["id"],
+              replay.text[:160])
+        check("重放不新增批次", len(httpx.get(f"{A}/api/state").json()["batches"]) == 3)
+
+        # 结构改变后，用旧版本重试同一编号：仍返回首次回执，不再入湖。
+        fields_now = {f["name"]: f["id"] for f in httpx.get(f"{A}/api/schema").json()["fields"]}
+        r = httpx.patch(
+            f"{B}/api/fields/{fields_now['temp_c']}",
+            json={"schema_version": v, "name": "temp_air"},
+        )
+        check("为幂等测试改名", r.status_code == 200, r.text[:120])
+        late = httpx.post(
+            f"{A}/api/batches",
+            data={"version": v, "upload_id": "selftest-dup-1"},
+            files={"file": ("dup.csv", dup_payload, "text/csv")},
+            timeout=30,
+        )
+        check("结构化后仍返回首次回执（不再校验旧版本）",
+              late.status_code == 200 and late.json()["id"] == first["id"], late.text[:160])
+        view = httpx.get(f"{A}/api/batches/{first['id']}").json()
+        check("重放批次按当前列名展示旧值",
+              cell(view, 0, "temp_air") == "66", view["columns"])
+
+        conflict = httpx.post(
+            f"{B}/api/batches",
+            data={"version": httpx.get(f"{A}/api/schema").json()["schema_version"],
+                  "upload_id": "selftest-dup-1"},
+            files={"file": ("other.csv", csv_bytes(
+                ["station_id", "observed_at", "temp_air", "humidity"],
+                [["54511", "2026-04-01T00:00:00Z", "67", "33"]],
+            ), "text/csv")},
+            timeout=30,
+        )
+        check("同编号不同文件被拒绝", conflict.status_code == 409
+              and conflict.json()["error"] == "upload_id_conflict", conflict.text[:160])
+        check("冲突后原批次与文件不变",
+              len(httpx.get(f"{A}/api/state").json()["batches"]) == 3
+              and len(list((data_dir / "parquet").glob("*.parquet"))) == 3)
+
+        # 双实例同时提交同一编号：至多登记一批，另一方得到同一回执。
+        race_payload = csv_bytes(
+            ["station_id", "observed_at", "temp_air", "humidity"],
+            [["54512", "2026-05-01T00:00:00Z", "77", "44"]],
+        )
+        v = httpx.get(f"{A}/api/schema").json()["schema_version"]
+        raced: list[httpx.Response] = []
+
+        def race(url: str) -> None:
+            raced.append(
+                httpx.post(
+                    f"{url}/api/batches",
+                    data={"version": v, "upload_id": "selftest-race"},
+                    files={"file": ("race.csv", race_payload, "text/csv")},
+                    timeout=30,
+                )
+            )
+
+        threads = [threading.Thread(target=race, args=(A,)), threading.Thread(target=race, args=(B,))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check("双实例并发同编号：一首次一重放",
+              sorted(r.status_code for r in raced) == [200, 201], [r.text[:80] for r in raced])
+        check("并发同编号只登记一批",
+              len({r.json()["id"] for r in raced}) == 1
+              and len(httpx.get(f"{A}/api/state").json()["batches"]) == 4)
+        final_integrity = httpx.get(f"{B}/api/integrity").json()
+        check("幂等测试后一致性自检通过",
+              final_integrity["ok"] and final_integrity["batches"] == 4, final_integrity)
         print("\n全部端到端检查通过。")
     finally:
         for path in stops:

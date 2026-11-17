@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -27,7 +28,7 @@ import time
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
@@ -42,6 +43,7 @@ MAX_ROWS = 1000
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_STATION_LENGTH = 256
 MAX_FIELD_NAME_LENGTH = 64
+MAX_UPLOAD_ID_LENGTH = 128
 
 STATION_COLUMN = "station_id"
 TIME_COLUMN = "observed_at"
@@ -77,6 +79,21 @@ class StaleSchema(LakeError):
         super().__init__(
             f"结构版本已过期：本次操作基于 v{expected}，当前已提交结构为 v{actual}。"
             "为避免旧结构写入，整次操作已被拒绝，请刷新页面后重试。"
+        )
+
+
+class UploadIdConflict(LakeError):
+    """同一上传编号已成功登记，但本次 CSV 字节不同。"""
+
+    status_code = 409
+    code = "upload_id_conflict"
+
+    def __init__(self, upload_id: str, batch: "Batch") -> None:
+        self.upload_id = upload_id
+        self.batch_id = batch.id
+        super().__init__(
+            f"上传编号“{upload_id}”已登记为批次 {batch.short_id}，"
+            "但本次 CSV 字节与首次上传不同。已拒绝本次上传，原批次保持不变。"
         )
 
 
@@ -161,6 +178,10 @@ class Batch:
     file_name: str
     file_sha256: str
     fields_at_upload: tuple[dict, ...]
+    # 可选的客户端上传编号（幂等键）；历史批次为 None。
+    upload_id: str | None = None
+    # 仅表示本次请求是否命中了已有回执，不写入数据库。
+    replayed: bool = False
 
     @property
     def short_id(self) -> str:
@@ -286,9 +307,24 @@ def initialize(settings: Settings) -> None:
                     row_count INTEGER NOT NULL,
                     file_name TEXT NOT NULL UNIQUE,
                     file_sha256 TEXT NOT NULL,
-                    schema_json TEXT NOT NULL
+                    schema_json TEXT NOT NULL,
+                    upload_id TEXT,
+                    upload_sha256 TEXT
                 )
                 """
+            )
+            # 兼容旧库：补上可选的幂等上传编号列。
+            existing_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(batches)").fetchall()
+            }
+            if "upload_id" not in existing_columns:
+                conn.execute("ALTER TABLE batches ADD COLUMN upload_id TEXT")
+            if "upload_sha256" not in existing_columns:
+                conn.execute("ALTER TABLE batches ADD COLUMN upload_sha256 TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_batches_upload_id "
+                "ON batches(upload_id) WHERE upload_id IS NOT NULL"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_batches_created_at "
@@ -367,6 +403,8 @@ def _rows_to_batch(row: sqlite3.Row) -> Batch:
         fields = tuple(json.loads(row["schema_json"]))
     except (TypeError, ValueError):
         fields = ()
+    keys = row.keys()
+    upload_id = row["upload_id"] if "upload_id" in keys else None
     return Batch(
         id=row["id"],
         created_at=row["created_at"],
@@ -375,6 +413,7 @@ def _rows_to_batch(row: sqlite3.Row) -> Batch:
         file_name=row["file_name"],
         file_sha256=row["file_sha256"],
         fields_at_upload=fields,
+        upload_id=upload_id,
     )
 
 
@@ -413,7 +452,7 @@ def read_state(settings: Settings) -> LakeState:
             schema = _query_schema(conn)
             rows = conn.execute(
                 "SELECT id, created_at, schema_version, row_count, file_name, "
-                "file_sha256, schema_json FROM batches "
+                "file_sha256, schema_json, upload_id FROM batches "
                 "ORDER BY created_at DESC, id DESC"
             ).fetchall()
             batches = tuple(_rows_to_batch(r) for r in rows)
@@ -862,12 +901,96 @@ def _write_parquet_atomic(
 # ---------------------------------------------------------------------------
 
 
-def upload_csv(settings: Settings, expected_version: int, data: bytes) -> Batch:
+def normalize_upload_id(raw: str | None) -> str | None:
+    """规范化可选上传编号；空串视为未提供。"""
+
+    if raw is None:
+        return None
+    value = unicodedata.normalize("NFC", str(raw).strip())
+    if not value:
+        return None
+    if len(value) > MAX_UPLOAD_ID_LENGTH:
+        raise ValidationError(f"上传编号最长 {MAX_UPLOAD_ID_LENGTH} 个字符。")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValidationError("上传编号不能包含控制字符。")
+    return value
+
+
+def _upload_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _find_batch_by_upload_id(
+    conn: sqlite3.Connection, upload_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT id, created_at, schema_version, row_count, file_name, "
+        "file_sha256, schema_json, upload_id, upload_sha256 FROM batches "
+        "WHERE upload_id = ?",
+        (upload_id,),
+    ).fetchone()
+
+
+def _replay_from_row(
+    settings: Settings, row: sqlite3.Row, upload_id: str, upload_sha256: str
+) -> Batch:
+    """把已登记的幂等编号解析成首次回执；不一致则拒绝，缺件则报完整性错误。"""
+
+    batch = _rows_to_batch(row)
+    stored_digest = row["upload_sha256"]
+    if stored_digest is None or not _digests_equal(stored_digest, upload_sha256):
+        # NULL 摘要无法证明字节相同，按冲突处理（失败关闭）。
+        raise UploadIdConflict(upload_id, batch)
+    if not (settings.parquet_dir / batch.file_name).is_file():
+        # 绝不把“已登记但文件缺失”的批次当作成功回执返回。
+        raise BatchIntegrityError(
+            f"上传编号对应的批次 {batch.short_id} 的 Parquet 文件缺失："
+            f"{batch.file_name}。请用一致性自检排查后再重试。"
+        )
+    return replace(batch, replayed=True)
+
+
+def _digests_equal(left: str, right: str) -> bool:
+    return hmac.compare_digest(left, right)
+
+
+def _lookup_replay(
+    settings: Settings, upload_id: str, upload_sha256: str
+) -> Batch | None:
+    """已登记同编号时返回首次回执 / 拒绝；未登记返回 None（编号可继续使用）。"""
+
+    try:
+        with _read_transaction(settings) as conn:
+            row = _find_batch_by_upload_id(conn, upload_id)
+    except sqlite3.Error as exc:
+        raise StorageError("读取上传编号登记失败。") from exc
+    if row is None:
+        return None
+    return _replay_from_row(settings, row, upload_id, upload_sha256)
+
+
+def upload_csv(
+    settings: Settings,
+    expected_version: int,
+    data: bytes,
+    upload_id: str | None = None,
+) -> Batch:
     """解析并转换后，在最终提交前再次校验结构版本。
 
     转换/写文件期间不持有数据库写锁，因此结构仍可被另一进程修改；提交时
     若版本已变化，则批次绝不登记，刚写的 Parquet 也会被清理。
+
+    ``upload_id`` 是可选幂等键：同编号 + 同 CSV 字节的重试返回首次批次，
+    不再读取当时结构（即使结构已变），也不再写文件；同编号不同字节拒绝。
     """
+
+    upload_id = normalize_upload_id(upload_id)
+    upload_sha256 = _upload_digest(data)
+    if upload_id is not None:
+        replay = _lookup_replay(settings, upload_id, upload_sha256)
+        if replay is not None:
+            log.info("replayed upload_id=%s as batch %s", upload_id, replay.id)
+            return replay
 
     schema = read_schema(settings)
     if schema.version != expected_version:
@@ -910,13 +1033,45 @@ def upload_csv(settings: Settings, expected_version: int, data: bytes) -> Batch:
             file_sha256=file_sha256,
             schema_json=schema_json,
             fields_at_upload=fields_at_upload,
+            upload_id=upload_id,
+            upload_sha256=upload_sha256 if upload_id is not None else None,
         )
+    except UploadIdConflict:
+        # 另一个实例在本次转换期间先登记了同编号：保留它的批次与文件，
+        # 丢弃本次刚写的 Parquet，然后按相同规则返回/拒绝。
+        _safe_unlink(final_path)
+        if upload_id is not None:
+            replay = _lookup_replay(settings, upload_id, upload_sha256)
+            if replay is not None:
+                log.info(
+                    "concurrent upload_id=%s resolved to batch %s",
+                    upload_id,
+                    replay.id,
+                )
+                return replay
+        raise
     except BaseException:
         _safe_unlink(final_path)
         raise
-    log.info(
-        "batch %s committed rows=%s schema=v%s", batch_id, len(parsed.stations), schema.version
-    )
+    if batch.id != batch_id:
+        # _commit_batch 在事务内发现同编号已被另一实例登记，返回了首次回执；
+        # 本次转换出的 Parquet 不属于任何登记，删除。
+        _safe_unlink(final_path)
+        if not (settings.parquet_dir / batch.file_name).is_file():
+            # 不把缺件批次当成功回执返回。
+            raise BatchIntegrityError(
+                f"上传编号“{upload_id}”已登记为批次 {batch.short_id}，"
+                f"但其 Parquet 文件缺失：{batch.file_name}。"
+                "请用一致性自检排查。"
+            )
+    else:
+        log.info(
+            "batch %s committed rows=%s schema=v%s upload_id=%s",
+            batch_id,
+            len(parsed.stations),
+            schema.version,
+            upload_id,
+        )
     return batch
 
 
@@ -931,13 +1086,24 @@ def _commit_batch(
     file_sha256: str,
     schema_json: str,
     fields_at_upload: Sequence[dict],
+    upload_id: str | None = None,
+    upload_sha256: str | None = None,
 ) -> Batch:
     try:
         with _write_transaction(settings) as conn:
+            if upload_id is not None:
+                existing = _find_batch_by_upload_id(conn, upload_id)
+                if existing is not None:
+                    batch = _rows_to_batch(existing)
+                    stored = existing["upload_sha256"]
+                    if stored is None or not _digests_equal(stored, upload_sha256):
+                        raise UploadIdConflict(upload_id, batch)
+                    return replace(batch, replayed=True)
             _check_expected_version(conn, expected_version)
             conn.execute(
                 "INSERT INTO batches(id, created_at, schema_version, row_count, "
-                "file_name, file_sha256, schema_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "file_name, file_sha256, schema_json, upload_id, upload_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     batch_id,
                     created_at,
@@ -946,10 +1112,29 @@ def _commit_batch(
                     file_name,
                     file_sha256,
                     schema_json,
+                    upload_id,
+                    upload_sha256,
                 ),
             )
     except LakeError:
         raise
+    except sqlite3.IntegrityError as exc:
+        if upload_id is not None and "batches.upload_id" in str(exc):
+            # 唯一索引兜底：并发写入同编号时以已提交批次为准。
+            try:
+                with _read_transaction(settings) as conn:
+                    existing = _find_batch_by_upload_id(conn, upload_id)
+                if existing is not None:
+                    batch = _rows_to_batch(existing)
+                    stored = existing["upload_sha256"]
+                    if stored is None or not _digests_equal(stored, upload_sha256):
+                        raise UploadIdConflict(upload_id, batch) from exc
+                    return replace(batch, replayed=True)
+            except LakeError:
+                raise
+            except sqlite3.Error:
+                pass
+        raise StorageError("批次登记失败，未写入新批次。") from exc
     except sqlite3.Error as exc:
         raise StorageError("批次登记失败，未写入新批次。") from exc
     return Batch(
@@ -960,6 +1145,7 @@ def _commit_batch(
         file_name=file_name,
         file_sha256=file_sha256,
         fields_at_upload=tuple(fields_at_upload),
+        upload_id=upload_id,
     )
 
 
@@ -971,7 +1157,7 @@ def get_batch(settings: Settings, batch_id: str) -> BatchView:
             schema = _query_schema(conn)
             row = conn.execute(
                 "SELECT id, created_at, schema_version, row_count, file_name, "
-                "file_sha256, schema_json FROM batches WHERE id = ?",
+                "file_sha256, schema_json, upload_id FROM batches WHERE id = ?",
                 (batch_id,),
             ).fetchone()
     except sqlite3.Error as exc:

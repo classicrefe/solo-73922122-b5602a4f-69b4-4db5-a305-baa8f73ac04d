@@ -28,6 +28,7 @@
       <dt>批次 ID</dt><dd>{{ batch.id }}</dd>
       <dt>入湖时间</dt><dd>{{ batch.created_at }}</dd>
       <dt>上传时结构</dt><dd>v{{ batch.schema_version }}</dd>
+      <dt>上传编号</dt><dd>{% if batch.upload_id %}{{ batch.upload_id }}{% else %}—{% endif %}</dd>
       <dt>行数</dt><dd>{{ batch.row_count }}</dd>
       <dt>Parquet</dt><dd>{{ batch.file_name }}</dd>
       <dt>SHA-256</dt><dd>{{ batch.file_sha256 }}</dd>
@@ -74,5 +75,6 @@
 <footer class="foot">
   实例 {{ settings.instance_name }} · 展示基于一次已提交结构与登记快照生成，下载内容同样来自该快照。
 </footer>
+<script src="/static/app.js"></script>
 </body>
 </html>

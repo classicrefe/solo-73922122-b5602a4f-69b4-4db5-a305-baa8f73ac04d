@@ -15,6 +15,12 @@
 
 <main>
   {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+  {% if form_version is not none and latest is not none and form_version|string != latest|string %}
+  <div class="flash error">
+    本次上传基于结构 v{{ form_version }}，当前已提交结构为 v{{ latest }}；为避免以旧结构入湖，
+    上传已被整次拒绝（未登记、未占用编号）。可刷新页面后沿用同一编号重试。
+  </div>
+  {% endif %}
   {% if latest is not none and latest != ack %}
   <div class="flash error">
     页面数据生成于结构 v{{ ack }}，但当前已提交结构已是 v{{ latest }}（可能由另一实例修改）。
@@ -100,6 +106,7 @@
               <th>入湖时间 (UTC)</th>
               <th>行数</th>
               <th>上传时结构</th>
+              <th>上传编号</th>
               <th></th>
             </tr>
           </thead>
@@ -110,6 +117,7 @@
               <td class="num">{{ batch.created_at }}</td>
               <td class="num">{{ batch.row_count }}</td>
               <td class="muted num">v{{ batch.schema_version }}</td>
+              <td class="muted">{% if batch.upload_id %}<code>{{ batch.upload_id }}</code>{% else %}—{% endif %}</td>
               <td>
                 <div class="row-actions">
                   <a href="/batches/{{ batch.id }}">查看</a>
@@ -134,17 +142,30 @@
           表头须含 <code>station_id</code>、<code>observed_at</code>，
           其余列名必须与当前 v{{ ack }} 的测量列一致；每批最多 1000 行。
         </p>
-        <form class="stack-form" method="post" action="/upload" enctype="multipart/form-data">
+        <form class="stack-form" method="post" action="/upload" enctype="multipart/form-data"
+              id="upload-form">
           <input type="hidden" name="version" value="{{ ack }}">
+          <label class="upload-id-field grow">
+            <span class="field-label">上传编号（可选）</span>
+            <input type="text" name="upload_id" id="upload-id" maxlength="128"
+                   value="{{ retry_upload_id or '' }}"
+                   placeholder="如 station-54511-20260101-001"
+                   autocomplete="off"
+                   aria-describedby="upload-id-hint">
+          </label>
           <input class="grow" type="file" name="file" accept=".csv,text/csv" required>
           <button type="submit">上传并转换</button>
         </form>
+        <p class="hint" id="upload-id-hint">
+          同一编号 + 同一 CSV 字节重复上传只登记首批，返回首次批次回执；编号相同而文件不同会被拒绝。
+          不填编号则按原有方式上传，每次都是新批次。
+        </p>
         <div class="downloads">
           <a href="/sample.csv">下载当前结构的示例 CSV</a>
         </div>
         <div class="notice">
           本次上传绑定结构 <strong>v{{ ack }}</strong>。若转换期间结构被另一实例修改，
-          整次上传会被拒绝，不会以旧结构入湖。
+          整次上传会被拒绝，不会以旧结构入湖；编号不会被占用，可修正后重新使用。
         </div>
       </section>
 

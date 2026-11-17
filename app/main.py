@@ -66,6 +66,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
             if isinstance(exc, lake.StaleSchema):
                 payload["expected_version"] = exc.expected
+            if isinstance(exc, lake.UploadIdConflict):
+                payload["upload_id"] = exc.upload_id
+                payload["batch_id"] = exc.batch_id
             return JSONResponse(payload, status_code=exc.status_code)
         if request.method in ("GET", "HEAD"):
             return _render_error(request, exc)
@@ -96,14 +99,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
-        state = lake.read_state(resolved)
-        return _render(
+        return _render_index(
             request,
-            "index.html",
-            state=state,
-            settings=resolved,
-            ack=state.schema.version,
-            latest=_latest_version(resolved),
             msg=request.query_params.get("msg"),
             kind=request.query_params.get("kind", "info"),
         )
@@ -163,12 +160,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         version: int = Form(...),
         file: UploadFile = File(...),
+        upload_id: str | None = Form(None),
     ):
-        data = await _read_upload(file)
-        batch = lake.upload_csv(resolved, version, data)
+        try:
+            data = await _read_upload(file)
+            batch = lake.upload_csv(resolved, version, data, upload_id=upload_id)
+        except LakeError as exc:
+            # 失败后仍停留在上传页，并把本次编号原样带回输入框，方便重试。
+            try:
+                return _render_index(
+                    request,
+                    msg=str(exc),
+                    kind="error",
+                    retry_upload_id=upload_id,
+                    status_code=exc.status_code,
+                    form_version=version,
+                )
+            except LakeError:
+                # 数据库本身不可读时退回纯错误页，不能再抛出。
+                return _render_error(request, exc)
+        if batch.replayed:
+            message = (
+                f"上传编号“{batch.upload_id}”已登记为批次 {batch.short_id}，"
+                f"本次为重复上传，未再次入湖（{batch.row_count} 行，"
+                f"结构 v{batch.schema_version}）。"
+            )
+        else:
+            message = (
+                f"批次 {batch.short_id} 已入湖（{batch.row_count} 行，"
+                f"结构 v{batch.schema_version}）。"
+            )
+            if batch.upload_id:
+                message += f" 上传编号：{batch.upload_id}。"
         return _redirect_with_message(
             request,
-            f"批次 {batch.short_id} 已入湖（{batch.row_count} 行，结构 v{batch.schema_version}）。",
+            message,
             "ok",
             path=f"/batches/{batch.id}",
         )
@@ -251,10 +277,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         version: int = Form(...),
         file: UploadFile = File(...),
+        upload_id: str | None = Form(None),
+        upload_no: str | None = Form(None),
     ):
         data = await _read_upload(file)
-        batch = lake.upload_csv(resolved, version, data)
-        return JSONResponse(_batch_payload(batch), status_code=201)
+        chosen_upload_id = _choose_upload_id(
+            upload_id,
+            upload_no,
+            request.query_params.get("upload_id"),
+            request.headers.get("Idempotency-Key"),
+            request.headers.get("X-Upload-Id"),
+        )
+        batch = lake.upload_csv(
+            resolved, version, data, upload_id=chosen_upload_id
+        )
+        return JSONResponse(
+            _batch_payload(batch, response=True),
+            status_code=200 if batch.replayed else 201,
+        )
 
     @app.get("/api/batches/{batch_id}")
     def api_batch(batch_id: str, format: str = "json"):
@@ -319,6 +359,44 @@ def _render(request: Request, name: str, **context):
     return templates.TemplateResponse(request, name, context)
 
 
+def _render_index(
+    request: Request,
+    *,
+    msg: str | None,
+    kind: str,
+    retry_upload_id: str | None = None,
+    status_code: int = 200,
+    form_version: int | str | None = None,
+) -> HTMLResponse:
+    """首页；失败上传时把编号带回表单，便于用户直接重试。
+
+    ``form_version`` 仅用于在“版本已过期”失败后提示刷新，页面其余表单
+    仍绑定当前已提交版本 ``ack``。
+    """
+
+    settings = resolved_settings(request)
+    state = lake.read_state(settings)
+    try:
+        retry_id = lake.normalize_upload_id(retry_upload_id)
+    except LakeError:
+        # 编号本身非法时也要把用户输入带回去，便于修正后重试。
+        retry_id = (retry_upload_id or "").strip() or None
+    context = {
+        "request": request,
+        "state": state,
+        "settings": settings,
+        "ack": state.schema.version,
+        "latest": _latest_version(settings),
+        "msg": msg,
+        "kind": kind,
+        "retry_upload_id": retry_id,
+        "form_version": form_version,
+    }
+    return templates.TemplateResponse(
+        request, "index.html", context, status_code=status_code
+    )
+
+
 def _render_error(request: Request, exc: LakeError) -> HTMLResponse:
     context = {
         "request": request,
@@ -342,6 +420,7 @@ _ERROR_TITLES = {
     "storage_error": "存储错误",
     "integrity_error": "数据完整性错误",
     "bad_request": "请求无效",
+    "upload_id_conflict": "上传编号已被占用",
 }
 
 
@@ -390,6 +469,22 @@ def _payload_version(payload: dict) -> int:
         raise lake.ValidationError("必须携带所见结构版本 schema_version。") from None
 
 
+def _choose_upload_id(*candidates: str | None) -> str | None:
+    """按优先级取第一个非空上传编号；同时提供不同编号视为请求错误。"""
+
+    chosen: str | None = None
+    for candidate in candidates:
+        normalized = lake.normalize_upload_id(candidate)
+        if normalized is None:
+            continue
+        if chosen is not None and normalized != chosen:
+            raise lake.ValidationError(
+                "一次上传只能提供一个非空上传编号，且各处取值必须一致。"
+            )
+        chosen = normalized
+    return chosen
+
+
 def _schema_payload(schema: lake.Schema) -> dict:
     return {
         "schema_version": schema.version,
@@ -417,8 +512,8 @@ def _schema_payload(schema: lake.Schema) -> dict:
     }
 
 
-def _batch_payload(batch: lake.Batch) -> dict:
-    return {
+def _batch_payload(batch: lake.Batch, *, response: bool = False) -> dict:
+    payload = {
         "id": batch.id,
         "short_id": batch.short_id,
         "created_at": batch.created_at,
@@ -427,7 +522,12 @@ def _batch_payload(batch: lake.Batch) -> dict:
         "file_name": batch.file_name,
         "file_sha256": batch.file_sha256,
         "fields_at_upload": list(batch.fields_at_upload),
+        "upload_id": batch.upload_id,
     }
+    if response:
+        # 仅在上传响应里说明本次是首次登记还是幂等重放。
+        payload["replayed"] = batch.replayed
+    return payload
 
 
 app = create_app()
